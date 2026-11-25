@@ -51,7 +51,7 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
 
   // Cloud server URL state (saved in localStorage)
   const [cloudUrl, setCloudUrl] = useState<string>(() => {
-    return localStorage.getItem('vocalcut_cloud_url') || 'https://audiolab-demucs.hf.space';
+    return localStorage.getItem('vocalcut_cloud_url') || 'nakas/demucs_playground';
   });
   const [showServerConfig, setShowServerConfig] = useState(false);
   const [serverHealthStatus, setServerHealthStatus] = useState<'idle' | 'checking' | 'online' | 'offline'>('idle');
@@ -375,7 +375,7 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
                   setCloudUrl(e.target.value);
                   setServerHealthStatus('idle');
                 }}
-                placeholder="https://your-space.hf.space or http://localhost:7860"
+                placeholder="nakas/demucs_playground or https://your-colab-url.loca.lt"
                 className="flex-1 w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500"
               />
 

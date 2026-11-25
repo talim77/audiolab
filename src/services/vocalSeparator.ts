@@ -1,13 +1,14 @@
 /**
  * Vocal & Background Music Separator Service
  * Supports:
- * 1. Cloud AI Separation via Remote Demucs Backend (Hugging Face / Colab) - 0 phone RAM used!
+ * 1. Cloud AI Separation via Hugging Face Spaces (Gradio) or Remote FastAPI / Colab backend - 0 phone RAM!
  * 2. Instant DSP Center-Channel Inversion (0.1s zero-download karaoke split) - 100% offline & safe
  * 3. Local Neural Separation via Demucs HTDemucs ONNX (WebGPU/WASM) for high-RAM PCs
  */
 
 import * as ort from 'onnxruntime-web';
 import { DemucsProcessor, CONSTANTS } from 'demucs-web';
+import { Client } from '@gradio/client';
 import { createAudioBufferFromChannels, cloneAudioBuffer } from './audioEditor';
 import { audioBufferToWav } from './audioExporter';
 import { getAudioContext } from './mediaExtractor';
@@ -31,11 +32,22 @@ const STORE_NAME = 'models';
 const MODEL_KEY = 'htdemucs_embedded';
 
 /**
- * Check if a custom Cloud Demucs server is reachable and online
+ * Check if a custom Cloud Demucs server or Space is reachable
  */
-export async function checkCloudHealth(serverUrl: string): Promise<boolean> {
+export async function checkCloudHealth(serverUrlOrSpace: string): Promise<boolean> {
   try {
-    const cleanUrl = serverUrl.replace(/\/+$/, '');
+    const trimmed = serverUrlOrSpace.trim();
+    if (trimmed.includes('/') && !trimmed.startsWith('http')) {
+      // Hugging Face Space name (e.g. 'nakas/demucs_playground')
+      const res = await fetch(`https://huggingface.co/api/spaces/${trimmed}`);
+      if (res.ok) {
+        const data = await res.json();
+        return data.runtime?.stage === 'RUNNING';
+      }
+      return false;
+    }
+
+    const cleanUrl = trimmed.replace(/\/+$/, '');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 6000);
     const res = await fetch(`${cleanUrl}/api/health`, {
@@ -50,10 +62,133 @@ export async function checkCloudHealth(serverUrl: string): Promise<boolean> {
 }
 
 /**
- * Executes high-quality Demucs separation on a FREE Cloud Server (Hugging Face / Colab)
- * Uses 0 MB phone RAM, making it 100% crash-proof on Android!
+ * Executes high-quality Demucs separation on a FREE Cloud Server
+ * Supports both Gradio Hugging Face Spaces (e.g. nakas/demucs_playground)
+ * and custom FastAPI/Colab servers. Uses 0 MB phone RAM!
  */
 export async function separateWithCloudAI(
+  audioBuffer: AudioBuffer,
+  serverUrlOrSpace: string,
+  onProgress?: (info: SeparationProgress) => void
+): Promise<SeparationResult> {
+  const target = serverUrlOrSpace.trim();
+
+  // If it's a Hugging Face Space (e.g. 'nakas/demucs_playground' or 'https://...hf.space')
+  const isGradioSpace = (target.includes('/') && !target.startsWith('http')) || target.includes('hf.space');
+
+  if (isGradioSpace) {
+    return await separateWithGradioClient(audioBuffer, target, onProgress);
+  } else {
+    return await separateWithRestApi(audioBuffer, target, onProgress);
+  }
+}
+
+/**
+ * Connects to a Hugging Face Space running Demucs via @gradio/client
+ */
+async function separateWithGradioClient(
+  audioBuffer: AudioBuffer,
+  spaceNameOrUrl: string,
+  onProgress?: (info: SeparationProgress) => void
+): Promise<SeparationResult> {
+  onProgress?.({
+    phase: 'init',
+    progress: 10,
+    message: `Connecting to Cloud Demucs AI (${spaceNameOrUrl})...`
+  });
+
+  const wavBlob = audioBufferToWav(audioBuffer);
+  const client = await Client.connect(spaceNameOrUrl);
+
+  onProgress?.({
+    phase: 'uploading',
+    progress: 30,
+    message: 'Uploading audio to Cloud AI...'
+  });
+
+  onProgress?.({
+    phase: 'separating',
+    progress: 60,
+    message: 'Cloud Demucs AI is separating vocals and instruments...'
+  });
+
+  const result: any = await client.predict('/predict', [wavBlob]);
+
+  onProgress?.({
+    phase: 'loading',
+    progress: 85,
+    message: 'Downloading and decoding separated stems...'
+  });
+
+  const ctx = getAudioContext();
+  if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+
+  const stemsData = result.data;
+  if (!stemsData || !Array.isArray(stemsData) || stemsData.length === 0) {
+    throw new Error('No audio returned from cloud model');
+  }
+
+  const decodeStem = async (stem: any): Promise<AudioBuffer> => {
+    const url = typeof stem === 'string' ? stem : stem.url || stem.data;
+    const res = await fetch(url);
+    const buf = await res.arrayBuffer();
+    return await ctx.decodeAudioData(buf);
+  };
+
+  // Stems layout for Demucs 4-stem: [vocals, bass, drums, other]
+  // Stems layout for 2-stem: [vocals, no_vocals]
+  const vocalsBuffer = await decodeStem(stemsData[0]);
+  let instrumentalBuffer: AudioBuffer;
+
+  if (stemsData.length === 2) {
+    instrumentalBuffer = await decodeStem(stemsData[1]);
+  } else if (stemsData.length >= 4) {
+    const [bassBuf, drumsBuf, otherBuf] = await Promise.all([
+      decodeStem(stemsData[1]),
+      decodeStem(stemsData[2]),
+      decodeStem(stemsData[3])
+    ]);
+
+    // Mix bass + drums + other into one instrumental buffer
+    const length = Math.max(bassBuf.length, drumsBuf.length, otherBuf.length);
+    const sampleRate = bassBuf.sampleRate;
+    const channels = Math.max(bassBuf.numberOfChannels, drumsBuf.numberOfChannels, otherBuf.numberOfChannels);
+    instrumentalBuffer = ctx.createBuffer(channels, length, sampleRate);
+
+    for (let ch = 0; ch < channels; ch++) {
+      const dst = instrumentalBuffer.getChannelData(ch);
+      const bData = bassBuf.getChannelData(Math.min(ch, bassBuf.numberOfChannels - 1));
+      const dData = drumsBuf.getChannelData(Math.min(ch, drumsBuf.numberOfChannels - 1));
+      const oData = otherBuf.getChannelData(Math.min(ch, otherBuf.numberOfChannels - 1));
+
+      for (let i = 0; i < length; i++) {
+        const b = i < bData.length ? bData[i] : 0;
+        const d = i < dData.length ? dData[i] : 0;
+        const o = i < oData.length ? oData[i] : 0;
+        dst[i] = Math.max(-1, Math.min(1, b + d + o));
+      }
+    }
+  } else {
+    instrumentalBuffer = cloneAudioBuffer(vocalsBuffer);
+  }
+
+  onProgress?.({
+    phase: 'done',
+    progress: 100,
+    message: 'Cloud AI separation complete!'
+  });
+
+  return {
+    vocalsBuffer,
+    instrumentalBuffer,
+    mode: 'cloud'
+  };
+}
+
+/**
+ * Connects to custom FastAPI / Colab server via REST
+ */
+async function separateWithRestApi(
   audioBuffer: AudioBuffer,
   serverUrl: string,
   onProgress?: (info: SeparationProgress) => void
@@ -76,7 +211,6 @@ export async function separateWithCloudAI(
     message: 'Uploading audio to Cloud AI server...'
   });
 
-  // Use XMLHttpRequest to monitor upload progress
   const responseData: any = await new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${cleanUrl}/api/separate`);
@@ -95,9 +229,8 @@ export async function separateWithCloudAI(
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
-          const json = JSON.parse(xhr.responseText);
-          resolve(json);
-        } catch (e) {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
           reject(new Error('Invalid JSON response from server'));
         }
       } else {
@@ -128,7 +261,6 @@ export async function separateWithCloudAI(
     await ctx.resume().catch(() => {});
   }
 
-  // Fetch and decode base64 audio
   const fetchAudioBuffer = async (dataUri: string): Promise<AudioBuffer> => {
     const res = await fetch(dataUri);
     const buf = await res.arrayBuffer();
@@ -214,7 +346,6 @@ export async function separateWithDemucsAI(
 ): Promise<SeparationResult> {
   const sampleRate = CONSTANTS.SAMPLE_RATE; // 44100Hz expected
 
-  // Resample if necessary using OfflineAudioContext
   let processBuffer = audioBuffer;
   if (audioBuffer.sampleRate !== sampleRate) {
     onProgress?.({
@@ -234,7 +365,6 @@ export async function separateWithDemucsAI(
     processBuffer = await offlineCtx.startRendering();
   }
 
-  // Get stereo channels
   let leftChannel: Float32Array;
   let rightChannel: Float32Array;
 
@@ -246,7 +376,6 @@ export async function separateWithDemucsAI(
     rightChannel = processBuffer.getChannelData(1);
   }
 
-  // Initialize processor if not already loaded
   if (!cachedProcessor) {
     cachedProcessor = new DemucsProcessor({
       ort,
@@ -326,7 +455,6 @@ export async function separateWithDemucsAI(
       }
 
       const modelBuffer = combined.buffer;
-      // Cache in IndexedDB for instant future loads
       await saveModelBuffer(modelBuffer);
 
       onProgress?.({
@@ -346,7 +474,6 @@ export async function separateWithDemucsAI(
 
   const result = await cachedProcessor.separate(leftChannel, rightChannel);
 
-  // Combine instrumental = drums + bass + other
   const totalSamples = leftChannel.length;
   const instLeft = new Float32Array(totalSamples);
   const instRight = new Float32Array(totalSamples);
@@ -388,7 +515,6 @@ export function separateWithDSP(audioBuffer: AudioBuffer): SeparationResult {
   const sampleRate = audioBuffer.sampleRate;
 
   if (audioBuffer.numberOfChannels < 2) {
-    // If mono, center cancellation is not possible; return duplicate
     const vocals = cloneAudioBuffer(audioBuffer);
     const instrumental = cloneAudioBuffer(audioBuffer);
     return {
@@ -410,16 +536,12 @@ export function separateWithDSP(audioBuffer: AudioBuffer): SeparationResult {
     const l = left[i];
     const r = right[i];
 
-    // Out-of-phase difference removes center-panned lead vocals
     const diff = (l - r) * 0.707;
-    // Center channel extraction
     const sum = (l + r) * 0.5;
 
-    // Instrumental contains stereo sides
     instLeft[i] = diff;
     instRight[i] = -diff;
 
-    // Vocals contains center focus
     vocLeft[i] = sum;
     vocRight[i] = sum;
   }

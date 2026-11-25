@@ -1,53 +1,40 @@
-# 🎵 AudioLab (VocalCut Studio)
+# AudioLab — VocalCut Studio (AI Vocal Separator & MP3 Editor)
 
-An all-in-one, privacy-focused, client-side Web Audio Studio & Progressive Web App (PWA). Extract vocals and background music using neural AI, trim/cut/merge audio clips, and extract audio from videos with zero server uploads.
+**Live Web App / PWA:** [https://talim77.github.io/audiolab/](https://talim77.github.io/audiolab/)  
+**Portfolio Hub:** [https://talim77.github.io/portfolio/](https://talim77.github.io/portfolio/)
 
-![VocalCut Studio](public/favicon.svg)
-
----
-
-## 🚀 Key Features
-
-* **AI Vocal & Background Music Separator**:
-  * **Meta HTDemucs AI Mode**: Runs locally via WebGPU/WASM for studio-grade vocal & instrumental isolation. Models cached in IndexedDB for permanent offline access.
-  * **Instant Karaoke Filter (DSP Mode)**: 0.1-second center-channel cancellation without any model downloads.
-* **Zero-Step Video Ingestion**:
-  * Drop any video (`.mp4`, `.webm`, `.mkv`, `.mov`) or audio (`.mp3`, `.wav`, `.aac`, `.flac`).
-  * Audio track is extracted automatically in-memory.
-* **Studio Audio Editor**:
-  * Interactive 60 FPS waveform with selection drag handles.
-  * **Trim** & **Cut** regions with millisecond precision.
-  * **Merge / Append** another track to the end.
-  * **Smooth Fades**: Configurable Fade-In and Fade-Out (0s to 5s).
-  * **Volume Boost & Normalize**: Up to 250% gain boost or 98% peak normalization.
-  * **Playback Speed**: 0.5x, 0.75x, 1x, 1.25x, 1.5x, 2x tempo presets.
-* **Export Engine**:
-  * Client-side MP3 encoding (128 kbps, 192 kbps, 320 kbps Studio Quality) via `@breezystack/lamejs`.
-  * Lossless 16-bit uncompressed WAV export.
-* **PWA (Progressive Web App)**:
-  * Installable directly on Android, iOS, Windows, and Mac as a standalone app.
-  * Fully offline-capable once installed.
+An installable Progressive Web App (PWA) and Web Audio Studio built with React 19, TypeScript, Vite, and Tailwind CSS. Extract vocals and background music using AI (local WebGPU/WASM or free Hugging Face / Colab Cloud Demucs backend), ingest audio directly from videos, trim/cut/merge clips on an interactive waveform, and export MP3 or lossless WAV tracks.
 
 ---
 
-## 💻 Local Development
+## Key Features
+
+- **3-Mode Vocal & Instrumental Separation:**
+  - **Cloud AI Demucs (`@gradio/client`):** Offloads Meta HTDemucs inference to a free Hugging Face Space or Google Colab T4 GPU (`backend/`) for zero-RAM mobile processing.
+  - **Local Neural AI (`demucs-web` + `onnxruntime-web`):** Runs Meta HTDemucs locally via WebGPU/WASM with IndexedDB model caching.
+  - **Instant DSP Karaoke Mode:** 0.1-second center-channel vocal cancellation with zero model downloads.
+- **Zero-Step Video-to-Audio Extraction:** Drop `.mp4`, `.webm`, `.mkv`, `.mov`, `.mp3`, `.wav`, `.aac`, `.m4a`, or `.flac` files directly in the browser.
+- **Interactive Waveform Studio (`wavesurfer.js`):** Trim, cut, merge/append clips, configure 0s–5s fade-in/out, boost volume up to 250% or normalize peaks to 98%, and adjust playback tempo (`0.5x`–`2x`).
+- **Client-Side Encoding:** Export 128/192/320 kbps MP3 (`@breezystack/lamejs`) or uncompressed 16-bit WAV.
+- **Installable Offline PWA:** Configured via `vite-plugin-pwa` and deployed to GitHub Pages via GitHub Actions.
+
+---
+
+## Tech Stack
+
+- **Frontend:** React 19, TypeScript, Vite, Tailwind CSS v4, Lucide Icons, `wavesurfer.js`
+- **Audio & AI:** Web Audio API, `demucs-web`, `onnxruntime-web`, `@gradio/client`, `@breezystack/lamejs`
+- **Optional Cloud Backend (`backend/`):** Python, Gradio, Demucs (Docker for Hugging Face Spaces & Google Colab notebook)
+
+---
+
+## Local Development
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Run local development server
 npm run dev
-
-# 3. Build for production
 npm run build
-
-# 4. Preview production build
 npm run preview
 ```
 
----
-
-## 🔒 100% Client-Side Privacy
-
-All processing (decoding, editing, AI stem separation, encoding) executes entirely inside your browser's local sandbox using the Web Audio API and WebGPU/WASM. No audio or video data is ever sent to any external server.
+See [WALKTHROUGH.md](WALKTHROUGH.md) for architecture details and component walkthrough.

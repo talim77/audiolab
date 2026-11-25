@@ -79,7 +79,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onMediaLoaded }) => 
         <input
           ref={fileInputRef}
           type="file"
-          accept="audio/*,video/*,.mp3,.wav,.aac,.m4a,.ogg,.flac,.mp4,.webm,.mkv,.mov,.avi"
+          accept="audio/*,video/*"
+          onClick={(e) => e.stopPropagation()}
           onChange={handleFileSelect}
           className="hidden"
         />
@@ -88,7 +89,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onMediaLoaded }) => 
           <div className="flex flex-col items-center justify-center space-y-4 py-8">
             <Loader2 className="w-12 h-12 text-purple-400 animate-spin" />
             <p className="text-slate-200 font-medium text-lg">{loadingStatus}</p>
-            <p className="text-slate-400 text-sm">Decoding and extracting in-memory...</p>
+            <p className="text-slate-400 text-sm">Decoding audio in-memory...</p>
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center space-y-4">

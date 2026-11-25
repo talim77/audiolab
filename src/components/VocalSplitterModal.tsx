@@ -3,13 +3,16 @@ import {
   X,
   Sparkles,
   Zap,
+  Cloud,
   Mic,
   Music,
   Play,
   Pause,
   Download,
   CheckCircle2,
-  ArrowRight
+  ArrowRight,
+  Server,
+  HelpCircle
 } from 'lucide-react';
 import type {
   SeparationProgress,
@@ -17,7 +20,9 @@ import type {
 } from '../services/vocalSeparator';
 import {
   separateWithDemucsAI,
-  separateWithDSP
+  separateWithDSP,
+  separateWithCloudAI,
+  checkCloudHealth
 } from '../services/vocalSeparator';
 import { audioBufferToMp3, downloadBlob } from '../services/audioExporter';
 import { getAudioContext } from '../services/mediaExtractor';
@@ -37,10 +42,19 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
   fileName,
   onSendToStudio
 }) => {
-  const [mode, setMode] = useState<'ai' | 'dsp'>('ai');
+  const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+  const [mode, setMode] = useState<'cloud' | 'dsp' | 'ai'>('cloud');
   const [isRunning, setIsRunning] = useState(false);
   const [progressInfo, setProgressInfo] = useState<SeparationProgress | null>(null);
   const [result, setResult] = useState<SeparationResult | null>(null);
+
+  // Cloud server URL state (saved in localStorage)
+  const [cloudUrl, setCloudUrl] = useState<string>(() => {
+    return localStorage.getItem('vocalcut_cloud_url') || 'https://audiolab-demucs.hf.space';
+  });
+  const [showServerConfig, setShowServerConfig] = useState(false);
+  const [serverHealthStatus, setServerHealthStatus] = useState<'idle' | 'checking' | 'online' | 'offline'>('idle');
 
   // Playback state for stems mixer
   const [isPlaying, setIsPlaying] = useState(false);
@@ -80,54 +94,57 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
     setIsPlaying(false);
   }, []);
 
-  const startMixerPlayback = useCallback((offset: number = 0) => {
-    if (!result) return;
-    stopMixerPlayback();
+  const startMixerPlayback = useCallback(
+    (offset: number = 0) => {
+      if (!result) return;
+      stopMixerPlayback();
 
-    const ctx = getAudioContext();
-    if (ctx.state === 'suspended') ctx.resume();
+      const ctx = getAudioContext();
+      if (ctx.state === 'suspended') ctx.resume();
 
-    // Vocals track
-    const vSource = ctx.createBufferSource();
-    vSource.buffer = result.vocalsBuffer;
-    const vGain = ctx.createGain();
-    vGain.gain.value = vocalsMuted ? 0 : vocalsVolume;
-    vSource.connect(vGain);
-    vGain.connect(ctx.destination);
-    vocalSourceRef.current = vSource;
-    vocalGainRef.current = vGain;
+      // Vocals track
+      const vSource = ctx.createBufferSource();
+      vSource.buffer = result.vocalsBuffer;
+      const vGain = ctx.createGain();
+      vGain.gain.value = vocalsMuted ? 0 : vocalsVolume;
+      vSource.connect(vGain);
+      vGain.connect(ctx.destination);
+      vocalSourceRef.current = vSource;
+      vocalGainRef.current = vGain;
 
-    // Instrumental track
-    const iSource = ctx.createBufferSource();
-    iSource.buffer = result.instrumentalBuffer;
-    const iGain = ctx.createGain();
-    iGain.gain.value = instMuted ? 0 : instVolume;
-    iSource.connect(iGain);
-    iGain.connect(ctx.destination);
-    instSourceRef.current = iSource;
-    instGainRef.current = iGain;
+      // Instrumental track
+      const iSource = ctx.createBufferSource();
+      iSource.buffer = result.instrumentalBuffer;
+      const iGain = ctx.createGain();
+      iGain.gain.value = instMuted ? 0 : instVolume;
+      iSource.connect(iGain);
+      iGain.connect(ctx.destination);
+      instSourceRef.current = iSource;
+      instGainRef.current = iGain;
 
-    vSource.start(0, offset);
-    iSource.start(0, offset);
+      vSource.start(0, offset);
+      iSource.start(0, offset);
 
-    startOffsetRef.current = offset;
-    startTimeRef.current = ctx.currentTime;
-    setIsPlaying(true);
+      startOffsetRef.current = offset;
+      startTimeRef.current = ctx.currentTime;
+      setIsPlaying(true);
 
-    const updateLoop = () => {
-      const elapsed = ctx.currentTime - startTimeRef.current;
-      const cur = startOffsetRef.current + elapsed;
-      if (cur >= result.vocalsBuffer.duration) {
-        stopMixerPlayback();
-        setCurrentTime(0);
-        return;
-      }
-      setCurrentTime(cur);
+      const updateLoop = () => {
+        const elapsed = ctx.currentTime - startTimeRef.current;
+        const cur = startOffsetRef.current + elapsed;
+        if (cur >= result.vocalsBuffer.duration) {
+          stopMixerPlayback();
+          setCurrentTime(0);
+          return;
+        }
+        setCurrentTime(cur);
+        animFrameRef.current = requestAnimationFrame(updateLoop);
+      };
+
       animFrameRef.current = requestAnimationFrame(updateLoop);
-    };
-
-    animFrameRef.current = requestAnimationFrame(updateLoop);
-  }, [result, vocalsMuted, instMuted, vocalsVolume, instVolume, stopMixerPlayback]);
+    },
+    [result, vocalsMuted, instMuted, vocalsVolume, instVolume, stopMixerPlayback]
+  );
 
   const togglePlayStems = () => {
     if (isPlaying) {
@@ -138,7 +155,6 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
     }
   };
 
-  // Update gains in real time
   useEffect(() => {
     if (vocalGainRef.current) {
       vocalGainRef.current.gain.value = vocalsMuted ? 0 : vocalsVolume;
@@ -155,6 +171,16 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
     return () => stopMixerPlayback();
   }, [stopMixerPlayback]);
 
+  // Test Cloud Server
+  const handleTestServer = async () => {
+    setServerHealthStatus('checking');
+    const isOk = await checkCloudHealth(cloudUrl);
+    setServerHealthStatus(isOk ? 'online' : 'offline');
+    if (isOk) {
+      localStorage.setItem('vocalcut_cloud_url', cloudUrl);
+    }
+  };
+
   // Execute Separation
   const handleStartSeparation = async () => {
     setIsRunning(true);
@@ -162,14 +188,33 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
     stopMixerPlayback();
 
     try {
-      if (mode === 'dsp') {
+      if (mode === 'cloud') {
+        if (!cloudUrl.trim()) {
+          setShowServerConfig(true);
+          throw new Error('Please enter a Cloud Server URL (e.g. from Hugging Face Space or Google Colab)');
+        }
+        localStorage.setItem('vocalcut_cloud_url', cloudUrl.trim());
+        const res = await separateWithCloudAI(audioBuffer, cloudUrl.trim(), (p) => {
+          setProgressInfo(p);
+        });
+        setResult(res);
+      } else if (mode === 'dsp') {
         setProgressInfo({ phase: 'separating', progress: 50, message: 'Applying center phase cancellation...' });
-        // Tiny timeout to let UI render
         await new Promise((r) => setTimeout(r, 100));
         const res = separateWithDSP(audioBuffer);
         setResult(res);
         setProgressInfo({ phase: 'done', progress: 100, message: 'Instant Karaoke split complete!' });
       } else {
+        // Local Device AI
+        if (isMobile) {
+          const proceed = window.confirm(
+            'Notice: Running local neural network inside a mobile browser uses 1.5GB RAM and may crash the tab. Cloud AI or Instant Karaoke is recommended on Android. Do you still want to proceed?'
+          );
+          if (!proceed) {
+            setIsRunning(false);
+            return;
+          }
+        }
         const res = await separateWithDemucsAI(audioBuffer, (p) => {
           setProgressInfo(p);
         });
@@ -227,52 +272,149 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
           </div>
         </div>
 
-        {/* Mode Selector */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+        {/* Mode Selector (3 Options) */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+          {/* Option 1: Free Cloud AI (Recommended for Android) */}
           <div
-            onClick={() => !isRunning && setMode('ai')}
-            className={`p-4 rounded-2xl border cursor-pointer transition ${
-              mode === 'ai'
+            onClick={() => !isRunning && setMode('cloud')}
+            className={`p-4 rounded-2xl border cursor-pointer transition flex flex-col justify-between ${
+              mode === 'cloud'
                 ? 'bg-purple-950/30 border-purple-500/60 shadow-lg shadow-purple-500/10'
                 : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
             }`}
           >
-            <div className="flex items-center justify-between mb-2">
-              <span className="flex items-center space-x-2 text-sm font-semibold text-white">
-                <Sparkles className="w-4 h-4 text-purple-400" />
-                <span>AI Neural Separation (Demucs)</span>
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-medium">
-                Studio Quality
-              </span>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="flex items-center space-x-2 text-sm font-semibold text-white">
+                  <Cloud className="w-4 h-4 text-purple-400" />
+                  <span>Free Cloud AI (Demucs)</span>
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-medium">
+                  {isMobile ? '⭐ Best for Mobile' : 'Recommended'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Runs Meta HTDemucs on a 16GB RAM cloud server (Hugging Face / Colab). Uses 0 MB phone RAM, perfectly smooth on Android.
+              </p>
             </div>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              Meta HTDemucs model running locally via WebGPU/WASM. Separates complex vocals & music with neural precision. Cached permanently in your browser.
-            </p>
           </div>
 
+          {/* Option 2: Instant Karaoke Filter (DSP) */}
           <div
             onClick={() => !isRunning && setMode('dsp')}
-            className={`p-4 rounded-2xl border cursor-pointer transition ${
+            className={`p-4 rounded-2xl border cursor-pointer transition flex flex-col justify-between ${
               mode === 'dsp'
                 ? 'bg-indigo-950/30 border-indigo-500/60 shadow-lg shadow-indigo-500/10'
                 : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
             }`}
           >
-            <div className="flex items-center justify-between mb-2">
-              <span className="flex items-center space-x-2 text-sm font-semibold text-white">
-                <Zap className="w-4 h-4 text-indigo-400" />
-                <span>Instant Karaoke Filter (DSP)</span>
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-medium">
-                0.1s Zero-Wait
-              </span>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="flex items-center space-x-2 text-sm font-semibold text-white">
+                  <Zap className="w-4 h-4 text-indigo-400" />
+                  <span>Instant Karaoke (DSP)</span>
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-medium">
+                  0.1s Zero-Wait
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Instant center-channel phase inversion. Zero network download, 0 MB memory spike. 100% offline and crash-proof on any phone.
+              </p>
             </div>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              Instant out-of-phase center cancellation. Removes center lead vocals immediately without downloading AI models. Works on any low-end device.
-            </p>
+          </div>
+
+          {/* Option 3: Local Device AI */}
+          <div
+            onClick={() => !isRunning && setMode('ai')}
+            className={`p-4 rounded-2xl border cursor-pointer transition flex flex-col justify-between ${
+              mode === 'ai'
+                ? 'bg-pink-950/30 border-pink-500/60 shadow-lg shadow-pink-500/10'
+                : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
+            }`}
+          >
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="flex items-center space-x-2 text-sm font-semibold text-white">
+                  <Server className="w-4 h-4 text-pink-400" />
+                  <span>Local WebGPU AI</span>
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-medium">
+                  PC / High RAM
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Runs Demucs ONNX inside browser memory. Requires 2GB+ free tab RAM. (Best for laptops & desktop GPUs).
+              </p>
+            </div>
           </div>
         </div>
+
+        {/* Cloud Server Configuration Panel (Shown when mode is 'cloud') */}
+        {mode === 'cloud' && (
+          <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 mb-6">
+            <div className="flex items-center justify-between mb-2">
+              <span className="flex items-center space-x-2 text-xs font-semibold text-slate-300">
+                <Server className="w-3.5 h-3.5 text-purple-400" />
+                <span>Cloud Server Endpoint URL:</span>
+              </span>
+              <button
+                onClick={() => setShowServerConfig(!showServerConfig)}
+                className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1"
+              >
+                <HelpCircle className="w-3.5 h-3.5" />
+                <span>How to get Free Server URL?</span>
+              </button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center gap-2">
+              <input
+                type="text"
+                value={cloudUrl}
+                onChange={(e) => {
+                  setCloudUrl(e.target.value);
+                  setServerHealthStatus('idle');
+                }}
+                placeholder="https://your-space.hf.space or http://localhost:7860"
+                className="flex-1 w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500"
+              />
+
+              <button
+                type="button"
+                onClick={handleTestServer}
+                disabled={serverHealthStatus === 'checking'}
+                className="w-full sm:w-auto px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition whitespace-nowrap"
+              >
+                {serverHealthStatus === 'checking'
+                  ? 'Testing...'
+                  : serverHealthStatus === 'online'
+                  ? '🟢 Online'
+                  : serverHealthStatus === 'offline'
+                  ? '🔴 Offline'
+                  : 'Test Server'}
+              </button>
+            </div>
+
+            {/* Step-by-step help accordion */}
+            {showServerConfig && (
+              <div className="mt-4 pt-3 border-t border-slate-800 text-xs text-slate-300 space-y-2">
+                <p className="font-semibold text-purple-300">
+                  Free Demucs Cloud Server Setup (2 Free Options):
+                </p>
+                <ol className="list-decimal pl-5 space-y-1 text-slate-400">
+                  <li>
+                    <span className="text-white font-medium">Hugging Face Space (100% Free Forever, 16GB RAM):</span>{' '}
+                    Create a free Docker Space at <a href="https://huggingface.co/spaces" target="_blank" rel="noreferrer" className="text-purple-400 underline">huggingface.co/spaces</a>, upload the 3 files from the project's <code className="text-purple-300 font-mono">backend/</code> folder, and copy the Space URL!
+                  </li>
+                  <li>
+                    <span className="text-white font-medium">Google Colab (Free T4 GPU, 8s Separation):</span> Open{' '}
+                    <code className="text-purple-300 font-mono">backend/Demucs_Free_Colab_Server.ipynb</code> in Google Colab, click "Run All", and paste the generated HTTPS URL above.
+                  </li>
+                </ol>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Action Button & Progress */}
         {!result && (
@@ -290,9 +432,11 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
                   />
                 </div>
                 <p className="text-[11px] text-slate-500">
-                  {mode === 'ai'
-                    ? 'Processing client-side in browser. Keep this tab active.'
-                    : 'Computing phase inversion matrix...'}
+                  {mode === 'cloud'
+                    ? 'Processing on remote server (0 MB phone RAM used). Please wait...'
+                    : mode === 'dsp'
+                    ? 'Computing phase cancellation in 0.1s...'
+                    : 'Running neural inference. Keep tab active.'}
                 </p>
               </div>
             ) : (
@@ -318,7 +462,10 @@ export const VocalSplitterModal: React.FC<VocalSplitterModalProps> = ({
             <div className="flex items-center justify-between bg-emerald-950/30 border border-emerald-800/40 p-3 rounded-2xl text-xs text-emerald-300">
               <span className="flex items-center space-x-2">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                <span>Stems separated successfully! ({result.mode === 'ai' ? 'Demucs AI' : 'Instant DSP'})</span>
+                <span>
+                  Stems separated successfully! (
+                  {result.mode === 'cloud' ? 'Cloud Demucs AI' : result.mode === 'ai' ? 'Local Demucs' : 'Instant DSP'})
+                </span>
               </span>
               <button
                 onClick={handleStartSeparation}

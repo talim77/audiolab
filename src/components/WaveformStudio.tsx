@@ -179,8 +179,8 @@ export const WaveformStudio: React.FC<WaveformStudioProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Handle high DPI
-    const dpr = window.devicePixelRatio || 1;
+    // Handle high DPI (capped at 2 to prevent mobile GPU OOM crashes)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const rect = canvas.getBoundingClientRect();
     const width = rect.width;
     const height = rect.height;

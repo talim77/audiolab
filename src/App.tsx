@@ -41,7 +41,7 @@ export function App() {
   // When a new file is loaded
   const handleMediaLoaded = (newMedia: ExtractedMedia) => {
     setMedia(newMedia);
-    setOriginalBuffer(cloneAudioBuffer(newMedia.audioBuffer));
+    setOriginalBuffer(newMedia.audioBuffer);
     setUndoStack([]);
     setSelectionStart(0);
     setSelectionEnd(newMedia.audioBuffer.duration);

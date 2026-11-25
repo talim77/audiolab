@@ -1,7 +1,8 @@
 /**
  * Vocal & Background Music Separator Service
  * Supports:
- * 1. Cloud AI Separation via Hugging Face Spaces (Gradio) or Remote FastAPI / Colab backend - 0 phone RAM!
+ * 1. Cloud AI Separation via Gradio 4/5/6 Hugging Face Spaces (with auto-fallback & optional HF Token)
+ *    or Custom FastAPI / Google Colab backend - 0 phone RAM!
  * 2. Instant DSP Center-Channel Inversion (0.1s zero-download karaoke split) - 100% offline & safe
  * 3. Local Neural Separation via Demucs HTDemucs ONNX (WebGPU/WASM) for high-RAM PCs
  */
@@ -10,7 +11,7 @@ import * as ort from 'onnxruntime-web';
 import { DemucsProcessor, CONSTANTS } from 'demucs-web';
 import { Client } from '@gradio/client';
 import { createAudioBufferFromChannels, cloneAudioBuffer } from './audioEditor';
-import { audioBufferToWav } from './audioExporter';
+import { audioBufferToMp3, audioBufferToWav } from './audioExporter';
 import { getAudioContext } from './mediaExtractor';
 
 export interface SeparationResult {
@@ -19,6 +20,7 @@ export interface SeparationResult {
   drumsBuffer?: AudioBuffer;
   bassBuffer?: AudioBuffer;
   mode: 'ai' | 'dsp' | 'cloud';
+  providerLabel?: string;
 }
 
 export interface SeparationProgress {
@@ -27,27 +29,61 @@ export interface SeparationProgress {
   message: string;
 }
 
+export const DEFAULT_CLOUD_SPACES = [
+  'csukuangfj/music-source-separation',
+  'teamup-tech/Demucs'
+] as const;
+
+const LEGACY_BROKEN_DEFAULTS = [
+  'nakas/demucs_playground',
+  'https://audiolab-demucs.hf.space'
+];
+
+export function normalizeCloudTarget(rawValue: string | null | undefined): string {
+  const trimmed = (rawValue || '').trim();
+  if (!trimmed || LEGACY_BROKEN_DEFAULTS.includes(trimmed)) {
+    return 'auto';
+  }
+  return trimmed;
+}
+
 const DB_NAME = 'vocalcut_ai_cache';
 const STORE_NAME = 'models';
 const MODEL_KEY = 'htdemucs_embedded';
+
+/**
+ * Check if a Hugging Face Space is running and compatible with Gradio 4+
+ */
+async function isSpaceRunning(spaceId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`https://huggingface.co/api/spaces/${spaceId}`);
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data.runtime?.stage !== 'RUNNING') return false;
+    const sdkVer = String(data.cardData?.sdk_version || '');
+    if (sdkVer.startsWith('3.')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Check if a custom Cloud Demucs server or Space is reachable
  */
 export async function checkCloudHealth(serverUrlOrSpace: string): Promise<boolean> {
   try {
-    const trimmed = serverUrlOrSpace.trim();
-    if (trimmed.includes('/') && !trimmed.startsWith('http')) {
-      // Hugging Face Space name (e.g. 'nakas/demucs_playground')
-      const res = await fetch(`https://huggingface.co/api/spaces/${trimmed}`);
-      if (res.ok) {
-        const data = await res.json();
-        return data.runtime?.stage === 'RUNNING';
-      }
-      return false;
+    const target = normalizeCloudTarget(serverUrlOrSpace);
+    if (target === 'auto') {
+      const checks = await Promise.all(DEFAULT_CLOUD_SPACES.map(isSpaceRunning));
+      return checks.some(Boolean);
     }
 
-    const cleanUrl = trimmed.replace(/\/+$/, '');
+    if (target.includes('/') && !target.startsWith('http')) {
+      return await isSpaceRunning(target);
+    }
+
+    const cleanUrl = target.replace(/\/+$/, '');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 6000);
     const res = await fetch(`${cleanUrl}/api/health`, {
@@ -63,56 +99,144 @@ export async function checkCloudHealth(serverUrlOrSpace: string): Promise<boolea
 
 /**
  * Executes high-quality Demucs separation on a FREE Cloud Server
- * Supports both Gradio Hugging Face Spaces (e.g. nakas/demucs_playground)
- * and custom FastAPI/Colab servers. Uses 0 MB phone RAM!
+ * Supports 'auto' multi-space fallback, specific Gradio 4/5/6 Spaces,
+ * and custom FastAPI/Colab servers. Uses MP3 upload for 8x faster mobile uploads!
  */
 export async function separateWithCloudAI(
   audioBuffer: AudioBuffer,
   serverUrlOrSpace: string,
-  onProgress?: (info: SeparationProgress) => void
+  onProgress?: (info: SeparationProgress) => void,
+  hfToken?: string
 ): Promise<SeparationResult> {
-  const target = serverUrlOrSpace.trim();
+  const target = normalizeCloudTarget(serverUrlOrSpace);
+  const cleanToken = (hfToken || '').trim() || undefined;
 
-  // If it's a Hugging Face Space (e.g. 'nakas/demucs_playground' or 'https://...hf.space')
-  const isGradioSpace = (target.includes('/') && !target.startsWith('http')) || target.includes('hf.space');
+  onProgress?.({
+    phase: 'init',
+    progress: 10,
+    message: 'Compressing audio to MP3 for fast cloud upload...'
+  });
+
+  // Encode to 192kbps MP3 (~8x smaller than WAV, critical for mobile data/speed)
+  const mp3Blob = await audioBufferToMp3(audioBuffer, 192, (pct) => {
+    onProgress?.({
+      phase: 'init',
+      progress: 10 + Math.round(pct * 0.1),
+      message: `Preparing upload audio (${pct}%)...`
+    });
+  });
+  const uploadFile = new File([mp3Blob], 'track.mp3', { type: 'audio/mp3' });
+
+  // Auto mode: try verified Gradio 4/6 Spaces with automatic fallback
+  if (target === 'auto') {
+    const errors: string[] = [];
+    for (let i = 0; i < DEFAULT_CLOUD_SPACES.length; i++) {
+      const space = DEFAULT_CLOUD_SPACES[i];
+      try {
+        return await separateWithGradioClient(uploadFile, space, cleanToken, onProgress);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`${space}: ${msg}`);
+        if (i < DEFAULT_CLOUD_SPACES.length - 1) {
+          onProgress?.({
+            phase: 'init',
+            progress: 22,
+            message: `Switching to backup Cloud AI server (${DEFAULT_CLOUD_SPACES[i + 1]})...`
+          });
+        }
+      }
+    }
+    throw new Error(`All free Cloud AI servers are currently busy. (${errors.join(' | ')})`);
+  }
+
+  const isGradioSpace =
+    (target.includes('/') && !target.startsWith('http')) || target.includes('hf.space');
 
   if (isGradioSpace) {
-    return await separateWithGradioClient(audioBuffer, target, onProgress);
+    return await separateWithGradioClient(uploadFile, target, cleanToken, onProgress);
   } else {
     return await separateWithRestApi(audioBuffer, target, onProgress);
   }
 }
 
 /**
- * Connects to a Hugging Face Space running Demucs via @gradio/client
+ * Mix multiple AudioBuffers in parallel (summing channels into one instrumental track)
+ */
+function mixBuffersParallel(buffers: AudioBuffer[]): AudioBuffer {
+  const ctx = getAudioContext();
+  const length = Math.max(...buffers.map((b) => b.length));
+  const sampleRate = buffers[0].sampleRate;
+  const channels = Math.max(...buffers.map((b) => b.numberOfChannels));
+  const mixed = ctx.createBuffer(channels, length, sampleRate);
+
+  for (let ch = 0; ch < channels; ch++) {
+    const dst = mixed.getChannelData(ch);
+    for (const buf of buffers) {
+      const src = buf.getChannelData(Math.min(ch, buf.numberOfChannels - 1));
+      for (let i = 0; i < src.length; i++) {
+        dst[i] = Math.max(-1, Math.min(1, dst[i] + src[i]));
+      }
+    }
+  }
+  return mixed;
+}
+
+/**
+ * Connects to a Gradio 4/5/6 Hugging Face Space running Demucs via @gradio/client
  */
 async function separateWithGradioClient(
-  audioBuffer: AudioBuffer,
+  audioFile: File,
   spaceNameOrUrl: string,
+  hfToken: string | undefined,
   onProgress?: (info: SeparationProgress) => void
 ): Promise<SeparationResult> {
   onProgress?.({
     phase: 'init',
-    progress: 10,
-    message: `Connecting to Cloud Demucs AI (${spaceNameOrUrl})...`
+    progress: 25,
+    message: `Connecting to Cloud AI (${spaceNameOrUrl})...`
   });
 
-  const wavBlob = audioBufferToWav(audioBuffer);
-  const client = await Client.connect(spaceNameOrUrl);
+  const connectOpts = hfToken ? { token: hfToken as `hf_${string}` } : undefined;
+  const client = await Client.connect(spaceNameOrUrl, connectOpts);
 
   onProgress?.({
     phase: 'uploading',
-    progress: 30,
-    message: 'Uploading audio to Cloud AI...'
+    progress: 40,
+    message: `Uploading track (${(audioFile.size / 1024 / 1024).toFixed(2)} MB) to Cloud AI...`
   });
+
+  // Inspect endpoints so we call the right endpoint and map output stems accurately
+  const apiInfo: any = await client.view_api();
+  const endpoints = apiInfo?.named_endpoints || {};
+
+  let endpointName = '/predict';
+  let payload: unknown[] = [audioFile];
+
+  if (endpoints['/process_uploaded_file']) {
+    endpointName = '/process_uploaded_file';
+    payload = [audioFile];
+  } else if (endpoints['/process']) {
+    endpointName = '/process';
+    const params = endpoints['/process'].parameters || [];
+    payload = params.length > 1 ? [audioFile, 'htdemucs'] : [audioFile];
+  } else if (!endpoints['/predict']) {
+    const firstAudioEndpoint = Object.keys(endpoints).find((key) =>
+      endpoints[key]?.parameters?.some((p: any) =>
+        ['Audio', 'File'].includes(p.component)
+      )
+    );
+    if (firstAudioEndpoint) {
+      endpointName = firstAudioEndpoint;
+    }
+  }
 
   onProgress?.({
     phase: 'separating',
     progress: 60,
-    message: 'Cloud Demucs AI is separating vocals and instruments...'
+    message: `Cloud Demucs AI (${spaceNameOrUrl}) is separating vocals & music...`
   });
 
-  const result: any = await client.predict('/predict', [wavBlob]);
+  const result: any = await client.predict(endpointName, payload);
 
   onProgress?.({
     phase: 'loading',
@@ -123,52 +247,85 @@ async function separateWithGradioClient(
   const ctx = getAudioContext();
   if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
 
-  const stemsData = result.data;
+  const stemsData = result?.data;
   if (!stemsData || !Array.isArray(stemsData) || stemsData.length === 0) {
     throw new Error('No audio returned from cloud model');
   }
 
+  // Filter only actual audio/file stem objects (ignore trailing HTML/text status items)
+  const audioStemItems = stemsData
+    .map((item: any, idx: number) => ({
+      item,
+      label: String(endpoints[endpointName]?.returns?.[idx]?.label || '').toLowerCase(),
+      name: String(item?.orig_name || item?.path || '').toLowerCase()
+    }))
+    .filter((entry) => {
+      if (!entry.item) return false;
+      if (typeof entry.item === 'string') return entry.item.startsWith('http');
+      return Boolean(entry.item.url || entry.item.data || entry.item.path);
+    });
+
+  if (audioStemItems.length === 0) {
+    throw new Error('Cloud server did not return playable audio URLs');
+  }
+
   const decodeStem = async (stem: any): Promise<AudioBuffer> => {
     const url = typeof stem === 'string' ? stem : stem.url || stem.data;
-    const res = await fetch(url);
+    let res = await fetch(url);
+    if ((res.status === 401 || res.status === 403) && hfToken) {
+      res = await fetch(url, { headers: { Authorization: `Bearer ${hfToken}` } });
+    }
+    if (!res.ok) {
+      throw new Error(`Failed to fetch separated audio stem (HTTP ${res.status})`);
+    }
     const buf = await res.arrayBuffer();
     return await ctx.decodeAudioData(buf);
   };
 
-  // Stems layout for Demucs 4-stem: [vocals, bass, drums, other]
-  // Stems layout for 2-stem: [vocals, no_vocals]
-  const vocalsBuffer = await decodeStem(stemsData[0]);
+  // Identify vocals stem vs accompaniment/instrumental/4-stem components
+  const vocalEntry = audioStemItems.find(
+    (e) => e.label.includes('vocal') || e.name.includes('vocal')
+  );
+
+  let vocalsBuffer: AudioBuffer;
   let instrumentalBuffer: AudioBuffer;
+  let drumsBuffer: AudioBuffer | undefined;
+  let bassBuffer: AudioBuffer | undefined;
 
-  if (stemsData.length === 2) {
-    instrumentalBuffer = await decodeStem(stemsData[1]);
-  } else if (stemsData.length >= 4) {
-    const [bassBuf, drumsBuf, otherBuf] = await Promise.all([
-      decodeStem(stemsData[1]),
-      decodeStem(stemsData[2]),
-      decodeStem(stemsData[3])
+  if (audioStemItems.length === 2 && !vocalEntry) {
+    // Standard 2-stem default [vocals, instrumental]
+    [vocalsBuffer, instrumentalBuffer] = await Promise.all([
+      decodeStem(audioStemItems[0].item),
+      decodeStem(audioStemItems[1].item)
     ]);
+  } else if (audioStemItems.length === 2) {
+    const otherEntry = audioStemItems.find((e) => e !== vocalEntry)!;
+    [vocalsBuffer, instrumentalBuffer] = await Promise.all([
+      decodeStem(vocalEntry!.item),
+      decodeStem(otherEntry.item)
+    ]);
+  } else if (audioStemItems.length >= 4) {
+    // 4-stem layout (e.g. teamup-tech/Demucs: [Drums, Bass, Vocals, Other])
+    const decoded = await Promise.all(audioStemItems.map((e) => decodeStem(e.item)));
+    const vocalIdx = audioStemItems.findIndex(
+      (e) => e.label.includes('vocal') || e.name.includes('vocal')
+    );
+    const vIdx = vocalIdx >= 0 ? vocalIdx : 2;
+    vocalsBuffer = decoded[vIdx];
 
-    // Mix bass + drums + other into one instrumental buffer
-    const length = Math.max(bassBuf.length, drumsBuf.length, otherBuf.length);
-    const sampleRate = bassBuf.sampleRate;
-    const channels = Math.max(bassBuf.numberOfChannels, drumsBuf.numberOfChannels, otherBuf.numberOfChannels);
-    instrumentalBuffer = ctx.createBuffer(channels, length, sampleRate);
+    const drumsIdx = audioStemItems.findIndex(
+      (e) => e.label.includes('drum') || e.name.includes('drum')
+    );
+    const bassIdx = audioStemItems.findIndex(
+      (e) => e.label.includes('bass') || e.name.includes('bass')
+    );
+    if (drumsIdx >= 0) drumsBuffer = decoded[drumsIdx];
+    if (bassIdx >= 0) bassBuffer = decoded[bassIdx];
 
-    for (let ch = 0; ch < channels; ch++) {
-      const dst = instrumentalBuffer.getChannelData(ch);
-      const bData = bassBuf.getChannelData(Math.min(ch, bassBuf.numberOfChannels - 1));
-      const dData = drumsBuf.getChannelData(Math.min(ch, drumsBuf.numberOfChannels - 1));
-      const oData = otherBuf.getChannelData(Math.min(ch, otherBuf.numberOfChannels - 1));
-
-      for (let i = 0; i < length; i++) {
-        const b = i < bData.length ? bData[i] : 0;
-        const d = i < dData.length ? dData[i] : 0;
-        const o = i < oData.length ? oData[i] : 0;
-        dst[i] = Math.max(-1, Math.min(1, b + d + o));
-      }
-    }
+    const instTracks = decoded.filter((_, idx) => idx !== vIdx);
+    instrumentalBuffer = mixBuffersParallel(instTracks);
   } else {
+    vocalsBuffer = await decodeStem(audioStemItems[0].item);
     instrumentalBuffer = cloneAudioBuffer(vocalsBuffer);
   }
 
@@ -181,7 +338,10 @@ async function separateWithGradioClient(
   return {
     vocalsBuffer,
     instrumentalBuffer,
-    mode: 'cloud'
+    drumsBuffer,
+    bassBuffer,
+    mode: 'cloud',
+    providerLabel: spaceNameOrUrl
   };
 }
 
@@ -281,7 +441,8 @@ async function separateWithRestApi(
   return {
     vocalsBuffer,
     instrumentalBuffer,
-    mode: 'cloud'
+    mode: 'cloud',
+    providerLabel: cleanUrl
   };
 }
 
